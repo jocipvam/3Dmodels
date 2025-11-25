@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebXR Geolokációs Horgony</title>
+    <!-- Tailwind CSS a stílusokért -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- A-Frame a 3D/AR élményért -->
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    <!-- AR.js a kamerás AR élmény szimulálásához (alapvető WebXR setup) -->
+    <script src="https://raw.githack.com/AR-js-org/AR.js/master/aframe/build/aframe-ar.js"></script>
+
+    <!-- Firebase SDK - Alapvető modulok -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firestore naplózás engedélyezése hibakereséshez
+        setLogLevel('debug');
+
+        // Globális változók a Canvas környezetből
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-webx-geo-app';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        // Geolokációs adatok és Horgony (Anchor)
+        let currentPosition = null;
+        let anchorPosition = null;
+
+        // Referenciák a DOM elemekre
+        const statusEl = document.getElementById('status-message');
+        const markerEl = document.getElementById('geo-marker');
+        const saveButton = document.getElementById('save-anchor-btn');
+
+        // Segédfüggvény: Haversine távolságszámítás (méterben)
+        // Megjegyzés: A Geolocation AR-hez ez az *igazi* távolság, nem a 2D euklideszi.
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371e3; // Föld sugara méterben
+            const phi1 = lat1 * Math.PI / 180;
+            const phi2 = lat2 * Math.PI / 180;
+            const deltaPhi = (lat2 - lat1) * Math.PI / 180;
+            const deltaLambda = (lon2 - lon1) * Math.PI / 180;
+
+            const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+                      Math.cos(phi1) * Math.cos(phi2) *
+                      Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+            return R * c; // Távolság méterben
+        }
+
+        // Firebase inicializálása és autentikáció
+        async function initializeFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    statusEl.textContent = 'Hiba: Hiányzik a Firebase konfiguráció.';
+                    return;
+                }
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        statusEl.textContent = `Azonosítva mint: ${userId}. Horgony betöltése...`;
+                    } else {
+                        // Ha nincs token, anonim bejelentkezés
+                        await signInAnonymously(auth);
+                    }
+                    isAuthReady = true;
+                    if (userId) {
+                        // 1. Töltse be a Horgonyt (ha van)
+                        loadAnchor(userId);
+                        // 2. Kezdje el a Geolocation figyelését
+                        startGeolocationWatch();
+                    }
+                });
+
+                // A Canvas által biztosított custom token használata
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    // Ha a token nincs definiálva, anonim bejelentkezés
+                    await signInAnonymously(auth);
+                }
+
+            } catch (error) {
+                console.error("Firebase inicializálási vagy autentikációs hiba:", error);
+                statusEl.textContent = `Súlyos hiba: ${error.message}`;
+            }
+        }
+
+        // --- Firestore Horgonykezelés ---
+
+        // Publikus elérési út a horgonyhoz (mindenki számára közös)
+        function getAnchorDocRef(uid) {
+            // A horgony publikus, de az alkalmazás azonosítója alatt van tárolva.
+            // A Firestore engedélyezési hibát az okozhatja, hogy a biztonsági szabályok túl szigorúak.
+            return doc(db, 'artifacts', appId, 'public', 'data', 'geo_anchor', 'main_anchor');
+        }
+
+        // Horgony mentése a Firestore-ba
+        window.saveAnchor = async function() {
+            if (!currentPosition || !isAuthReady) {
+                statusEl.textContent = 'Először meg kell határozni a pozíciót.';
+                return;
+            }
+
+            const anchorData = {
+                latitude: currentPosition.latitude,
+                longitude: currentPosition.longitude,
+                timestamp: Date.now(),
+                userId: userId
+            };
+
+            try {
+                const docRef = getAnchorDocRef(userId);
+                await setDoc(docRef, anchorData);
+                statusEl.textContent = `Horgony mentve: Lat=${currentPosition.latitude.toFixed(4)}, Lon=${currentPosition.longitude.toFixed(4)}.`;
+                // onSnapshot fogja frissíteni az anchorPosition-t
+            } catch (e) {
+                console.error("Horgony mentési hiba:", e);
+                statusEl.textContent = 'Hiba a horgony mentésekor.';
+            }
+        };
+
+        // Horgony betöltése és valós idejű figyelése
+        function loadAnchor(uid) {
+            const docRef = getAnchorDocRef(uid);
+
+            // Valós idejű figyelés (onSnapshot)
+            onSnapshot(docRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    anchorPosition = docSnap.data();
+                    statusEl.textContent = `Horgony betöltve. A mentett horgony adatai: Lat: ${anchorPosition.latitude.toFixed(4)}, Lon: ${anchorPosition.longitude.toFixed(4)}`;
+                } else {
+                    anchorPosition = null;
+                    statusEl.textContent = "Nincs még mentett horgony. Kattints a 'Mentés mint Horgony' gombra a rögzítéshez.";
+                }
+            }, (error) => {
+                console.error("Horgony betöltési hiba:", error);
+                statusEl.textContent = 'Hiba a horgony adatainak lekérésekor.';
+            });
+        }
+
+        // --- Geolocation figyelés és AR frissítés ---
+
+        function startGeolocationWatch() {
+            if (!navigator.geolocation) {
+                statusEl.textContent = 'Hiba: A böngésző nem támogatja a Geolocation API-t.';
+                return;
+            }
+
+            // Folyamatos pozíciófigyelés 5 másodpercenként
+            const watchId = navigator.geolocation.watchPosition(
+                (position) => {
+                    const coords = position.coords;
+                    currentPosition = {
+                        latitude: coords.latitude,
+                        longitude: coords.longitude,
+                        accuracy: coords.accuracy
+                    };
+                    
+                    // Frissítse a távolságot és a jelölő láthatóságát
+                    updateMarkerVisibility();
+
+                    // Engedélyezi a mentés gombot, amint megvan az első érvényes pozíció
+                    if (saveButton && saveButton.disabled) {
+                        saveButton.disabled = false;
+                    }
+                },
+                (error) => {
+                    console.warn(`Geolocation hiba (${error.code}): ${error.message}`);
+                    statusEl.textContent = `Geolocation hiba: ${error.message}`;
+                },
+                {
+                    enableHighAccuracy: true,
+                    timeout: 5000,
+                    maximumAge: 0
+                }
+            );
+            // Ha leállítanánk: navigator.geolocation.clearWatch(watchId);
+            
+            // Kezdeti állapot a státusz frissítéséhez
+            statusEl.textContent = 'Geolocation figyelés elindítva. Pozícióra várakozás...';
+        }
+
+        const PROXIMITY_THRESHOLD = 50; // 50 méteres közelség (ezen belül jelenik meg a jelölő)
+
+        function updateMarkerVisibility() {
+            if (!currentPosition) {
+                document.getElementById('current-pos-text').setAttribute('value', 'Helyzet: Nincs adat');
+                return;
+            }
+
+            document.getElementById('current-pos-text').setAttribute('value', `Helyzet pontossága: ${currentPosition.accuracy.toFixed(1)}m`);
+            
+            if (anchorPosition) {
+                const distance = getDistance(
+                    currentPosition.latitude, currentPosition.longitude,
+                    anchorPosition.latitude, anchorPosition.longitude
+                );
+                
+                document.getElementById('distance-text').setAttribute('value', `Távolság a horgonytól: ${distance.toFixed(1)} m`);
+
+                if (distance <= PROXIMITY_THRESHOLD) {
+                    // Megjelenítjük a jelölőt
+                    markerEl.setAttribute('visible', true);
+                    markerEl.setAttribute('material', 'color', '#4CAF50'); // Zöld
+                    document.getElementById('marker-status').setAttribute('value', '>>> KÖZEL VAN A HORGONY! <<<');
+                    document.getElementById('marker-status').setAttribute('color', '#4CAF50');
+                } else {
+                    // Elrejtjük a jelölőt
+                    markerEl.setAttribute('visible', false);
+                    document.getElementById('marker-status').setAttribute('value', 'A horgony távol van...');
+                    document.getElementById('marker-status').setAttribute('color', '#999');
+                }
+            } else {
+                document.getElementById('distance-text').setAttribute('value', 'Távolság: Nincs mentett horgony.');
+                markerEl.setAttribute('visible', false);
+                document.getElementById('marker-status').setAttribute('value', 'Horgony mentésére vár...');
+                document.getElementById('marker-status').setAttribute('color', '#999');
+            }
+        }
+
+
+        // Indítsa el az alkalmazást a betöltés után
+        window.onload = initializeFirebase;
+    </script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+            background-color: #f0f4f8;
+        }
+        #ui-overlay {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 16px;
+            z-index: 1000;
+            box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.1);
+            border-top-left-radius: 20px;
+            border-top-right-radius: 20px;
+        }
+        .btn-primary {
+            background-color: #4C51BF;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 12px;
+            font-weight: 600;
+            transition: background-color 0.3s;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .btn-primary:hover {
+            background-color: #434190;
+        }
+        #status-message {
+            min-height: 40px;
+            color: #1E3A8A;
+        }
+        /* Az A-Frame vászon kitölti a képernyőt */
+        a-scene {
+            height: 100vh;
+            width: 100vw;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- A-Frame Scene - AR mód bekapcsolásával -->
+    <a-scene 
+        vr-mode-ui="enabled: false" 
+        arjs="sourceType: webcam; detectionMode: mono; maxDetectionRate: 30; cameraParametersUrl: https://raw.githack.com/AR-js-org/AR.js/master/aframe/examples/js/vendor/ar.js/data/camera_para.dat; debugUIEnabled: false;"
+        embedded
+        renderer="logarithmicDepthBuffer: true;">
+
+        <!-- A kamera képét látjuk az AR.js segítségével -->
+        <a-entity camera></a-entity>
+
+        <!-- Geolokációs AR jelölő (Közelség esetén látható) -->
+        <!-- Ez az entitás fog megjelenni a képernyő közepén, ha közel vagyunk a horgonyhoz -->
+        <a-box 
+            id="geo-marker"
+            position="0 0 -5"
+            rotation="0 45 0"
+            color="#FF9800"
+            width="1"
+            height="1"
+            depth="1"
+            shadow
+            visible="false"
+            animation="property: rotation; to: 0 360 0; loop: true; dur: 8000; easing: linear;"></a-box>
+
+        <!-- Szöveg a jelölő állapotáról (a képernyő közepén) -->
+        <a-text
+            id="marker-status"
+            value="A horgony távol van..."
+            align="center"
+            position="0 1 -3"
+            color="#FFFFFF"
+            width="4"></a-text>
+
+        <!-- Szöveges debug adatok a felhasználó aktuális helyzetéről és távolságáról (a képernyő alján) -->
+        <a-text
+            id="current-pos-text"
+            value="Helyzet: Várakozás..."
+            align="left"
+            position="-1.5 -1 -3"
+            color="#FFF"
+            width="3"></a-text>
+
+        <a-text
+            id="distance-text"
+            value="Távolság: Nincs horgony."
+            align="right"
+            position="1.5 -1 -3"
+            color="#FFF"
+            width="3"></a-text>
+
+
+    </a-scene>
+
+    <!-- UI Fedvény -->
+    <div id="ui-overlay" class="flex flex-col gap-4">
+        <h1 class="text-xl font-bold text-gray-800">Geolokációs Horgonykezelő</h1>
+        
+        <!-- Státusz üzenet -->
+        <div id="status-message" class="text-sm font-medium text-blue-700 rounded-lg p-2 bg-blue-50">Betöltés...</div>
+
+        <!-- Gomb a Horgony mentéséhez -->
+        <button id="save-anchor-btn" onclick="saveAnchor()" class="btn-primary w-full disabled:opacity-50" disabled>
+            Aktuális Helyzet Mentése mint Horgony
+        </button>
+        <p class="text-xs text-gray-500 text-center">A Horgony a Firestore adatbázisban tárolódik, és minden felhasználó számára elérhető.</p>
+    </div>
+
+</body>
+</html>
